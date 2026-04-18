@@ -161,11 +161,47 @@ async def create_diary(diary: DiaryCreate,session: AsyncSession = Depends(get_se
 @app.get("/diaries/",response_model=List[DiaryRead])
 async def read_diaries(skip: int = 0, limit: int = 10, session: AsyncSession = Depends(get_session)):
     """
-    获取日记列表(支持offset/limit分页)
+    获取日记列表(支持offset/limit分页)(异步redis版本)
     """
+
+    cache_key = f"diaries:list:skip:{skip}:limit:{limit}"
+
+    #===================
+    # 1. 尝试从 Redis 缓存中获取数据
+    try:
+        cached_data = await redis_client.get(cache_key)
+        if cached_data:
+            print(f"命中缓存: {cache_key},极速响应！")
+            return json.loads(cached_data)  #如果缓存命中，直接返回解析后的数据
+    except Exception as e:
+        print(f"Redis error: {e},继续从数据库获取数据...")  #如果 Redis 出现问题，记录错误并继续正常流程
+    
+    #===================
+    # 2. 从数据库获取数据
+
+    print(f"缓存未命中: {cache_key},穿透至MySQL查询...")  #如果缓存未命中，记录日志
     statement = select(Diary).offset(skip).limit(limit)  #构建查询语句，支持分页
-    diaries = await session.exec(statement).all()  #执行查询并获取结果
+    result = await session.exec(statement)  #执行查询并获取结果
+    diaries = result.all()  #获取查询结果列表
+
+    #===================
+    # 3. 将查询结果存入 Redis 缓存，设置过期时间为60秒
+    if diaries:  #只有在查询结果非空时才缓存，避免缓存空结果
+        try:
+            # 序列化二步走：
+            # 1. jsonable_encoder: 把复杂的 SQLModel 对象拍扁成标准的字典/列表
+            # 2. json.dumps: 把字典转成可以在网络传输的 JSON 字符串
+            json_string = json.dumps(jsonable_encoder(diaries))
+            
+            # ⚠️ 异步写入，设置 60 秒过期（TTL），避免数据永久霸占内存
+            await redis_client.setex(cache_key, 60, json_string)
+            print(f"✅ 数据已回写至 Redis [{cache_key}]")
+        except Exception as e:
+            print(f"⚠️ Redis 写入故障: {e}")
+
     return diaries
+
+
 
 @app.get("/diaries/{diary_id}",response_model=DiaryRead)
 async def read_diary(diary_id: int, session: AsyncSession = Depends(get_session)):
@@ -176,6 +212,8 @@ async def read_diary(diary_id: int, session: AsyncSession = Depends(get_session)
     if not diary:
         raise HTTPException(status_code=404, detail="Diary not found")  #如果没有找到，抛出404错误
     return diary
+
+
 
 @app.delete("/diaries/{diary_id}")
 async def delete_diary(diary_id: int, session: AsyncSession = Depends(get_session)):
@@ -189,6 +227,8 @@ async def delete_diary(diary_id: int, session: AsyncSession = Depends(get_sessio
     await session.delete(diary)
     await session.commit()        #提交删除操作
     return {"message": "Diary deleted successfully"}  #返回删除成功的消息
+
+
 
 if __name__ == "__main__":
     import uvicorn
